@@ -1,0 +1,187 @@
+package app
+
+import (
+	"errors"
+	"mime"
+	"net/url"
+	"strconv"
+	"strings"
+	"time"
+
+	"gorm.io/gorm"
+	"yingce/backend/internal/assets"
+	"yingce/backend/internal/model"
+)
+
+type ResourceAccessOptions = assets.AccessOptions
+type ResourceAccessRequest = assets.AccessRequest
+type ResourceAccess = assets.ResourceAccess
+
+type ResourceAccessFailure struct {
+	Code    int    `json:"code"`
+	Reason  string `json:"reason"`
+	Message string `json:"msg"`
+}
+type ResourceAccessResult struct {
+	ResourceID string                 `json:"resourceId"`
+	Access     *ResourceAccess        `json:"access,omitempty"`
+	Error      *ResourceAccessFailure `json:"error,omitempty"`
+}
+
+func (s *Service) ResourceAccessBatch(userID string, requests []ResourceAccessRequest) ([]ResourceAccessResult, error) {
+	if userID == "" {
+		return nil, Unauthorized("请先登录")
+	}
+	if len(requests) == 0 || len(requests) > 100 {
+		return nil, BadAuthRequest("每批资源访问请求须为 1–100 项")
+	}
+	results := make([]ResourceAccessResult, 0, len(requests))
+	for _, request := range requests {
+		item := ResourceAccessResult{ResourceID: request.ResourceID}
+		options, err := assets.NormalizeAccessOptions(request.AccessOptions, false)
+		if err == nil {
+			var resource *model.Resource
+			resource, err = s.repo.ResourceForUser(userID, request.ResourceID)
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				err = NotFound("资源不存在或不可访问")
+			}
+			if err == nil {
+				item.Access, err = s.resolveResourceAccess(resource, options)
+			}
+		}
+		if err != nil {
+			item.Error = &ResourceAccessFailure{Code: 500, Reason: "resource_access_failed", Message: "资源访问失败"}
+			var appErr *AppError
+			if errors.As(err, &appErr) {
+				item.Error = &ResourceAccessFailure{Code: appErr.Code, Reason: string(appErr.Reason), Message: appErr.Message}
+			}
+		}
+		results = append(results, item)
+	}
+	return results, nil
+}
+
+func (s *Service) resolveResourceAccess(resource *model.Resource, options ResourceAccessOptions) (*ResourceAccess, error) {
+	if resource == nil {
+		return nil, NotFound("资源不存在")
+	}
+	var setting ossSettingValue
+	if resource.Provider != "local" {
+		var err error
+		setting, err = s.ossSettingForResource(resource.UserID, resource)
+		if err != nil {
+			return nil, WrapAppError(503, "无法解析资源实际存储位置", err)
+		}
+		setting = s.storageSettingWithRuntimePolicy(setting)
+	} else {
+		// 本地资源无需存储配置，只注入运行时策略，让平台签名地址同样遵循后台配置的有效期。
+		setting.Runtime = s.storageSettingWithRuntimePolicy(ossSettingValue{}).Runtime
+	}
+	return assets.ResolveAccess(resource, setting, options, time.Now().UTC(), func(variant assets.ResourceVariant, expires time.Time) (string, error) {
+		return s.signedResourceAccessURL(resource, variant, expires, options.Purpose == assets.PurposeProvider)
+	})
+}
+
+func (s *Service) PrepareResourceDelivery(userID, id string, options ResourceAccessOptions, rangeHeader string) (*ResourceDelivery, error) {
+	options, err := assets.NormalizeAccessOptions(options, false)
+	if err != nil {
+		return nil, err
+	}
+	resource, err := s.repo.ResourceForUser(userID, id)
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, NotFound("资源不存在或不可访问")
+	}
+	if err != nil {
+		return nil, err
+	}
+	return s.prepareResourceDelivery(userID, resource, options, rangeHeader)
+}
+
+func (s *Service) prepareResourceDelivery(userID string, resource *model.Resource, options ResourceAccessOptions, rangeHeader string) (*ResourceDelivery, error) {
+	if resource == nil || resource.UserID != userID {
+		return nil, Forbidden("资源不可访问")
+	}
+	access, err := s.resolveResourceAccess(resource, options)
+	if err != nil {
+		return nil, err
+	}
+	delivery := &ResourceDelivery{Resource: resource, Access: access}
+	if options.DescribeOnly || access.Delivery == assets.DeliveryCDN || access.Delivery == assets.DeliveryOrigin {
+		return delivery, nil
+	}
+	if access.ActualVariant == assets.VariantPlayback {
+		delivery.Stream, err = s.OpenResourcePlaybackRange(userID, resource.ID)
+	} else {
+		delivery.Stream, err = s.openResourceRange(userID, resource, rangeHeader)
+	}
+	if err != nil {
+		return nil, err
+	}
+	delivery.Resource = delivery.Stream.Resource
+	return delivery, nil
+}
+
+func (s *Service) signedResourceAccessURL(resource *model.Resource, variant assets.ResourceVariant, expires time.Time, provider bool) (string, error) {
+	expiry := strconv.FormatInt(expires.Unix(), 10)
+	signature, err := s.signPublicResource(resource.ID+"\n"+string(variant), expiry)
+	if err != nil {
+		return "", err
+	}
+	resourcePath := "/api/public/resources/" + url.PathEscape(resource.ID) + "/file"
+	if provider {
+		// Some providers inspect the entire URL suffix, including any query string.
+		// Keep the authorization in path segments so the URL ends in the media extension.
+		resourcePath = "/api/public/resources/" + url.PathEscape(resource.ID) + "/media/" + url.PathEscape(string(variant)) + "/" + expiry + "/" + url.PathEscape(signature) + "/resource." + providerResourceExtension(resource.MimeType)
+		base, err := s.publicResourceBaseURL()
+		if err != nil {
+			return "", err
+		}
+		return base.ResolveReference(&url.URL{Path: resourcePath}).String(), nil
+	}
+	u := &url.URL{Path: resourcePath}
+	q := u.Query()
+	q.Set("expires", expiry)
+	q.Set("signature", signature)
+	q.Set("variant", string(variant))
+	u.RawQuery = q.Encode()
+	return u.String(), nil
+}
+
+func providerResourceExtension(mimeType string) string {
+	mimeType = strings.ToLower(strings.TrimSpace(strings.Split(mimeType, ";")[0]))
+	switch mimeType {
+	case "image/jpeg":
+		return "jpg"
+	case "image/png":
+		return "png"
+	case "video/mp4":
+		return "mp4"
+	case "audio/mpeg":
+		return "mp3"
+	}
+	if extensions, err := mime.ExtensionsByType(mimeType); err == nil {
+		for _, extension := range extensions {
+			if len(extension) > 1 && extension[0] == '.' {
+				return strings.TrimPrefix(strings.ToLower(extension), ".")
+			}
+		}
+	}
+	return "bin"
+}
+
+func (s *Service) PreparePublicResourceDelivery(id, expires, signature string, options ResourceAccessOptions, rangeHeader string) (*ResourceDelivery, error) {
+	options, err := assets.NormalizeAccessOptions(options, false)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.verifyPublicResourceSignature(id+"\n"+string(options.Variant), expires, signature); err != nil {
+		return nil, err
+	}
+	resource, err := s.repo.Resource(id)
+	if err != nil {
+		return nil, Forbidden("匿名下载链接无效")
+	}
+	seconds, _ := strconv.ParseInt(expires, 10, 64)
+	options.ExpiresAt = time.Unix(seconds, 0)
+	return s.prepareResourceDelivery(resource.UserID, resource, options, rangeHeader)
+}
